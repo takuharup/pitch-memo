@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="音程メモ">
+<style>:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0}[hidden]{display:none!important}*{box-sizing:border-box}</style>
+</head>
+<body>
+<title>音程メモ</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Zen+Kaku+Gothic+New:wght@400;700&display=swap">
+<style>
+/* Layout: one narrow column — big live readout, one record button, list of saved pitches below */
+:root{
+  --bg:#eef1f4; --surface:#ffffff; --fg:#1b2129; --muted:#5d6774; --line:#d5dbe2;
+  --accent:#a8670f; --accent-ink:#ffffff; --rec:#c2352b;
+  --mono:"JetBrains Mono",ui-monospace,Menlo,monospace;
+  --body:"Zen Kaku Gothic New","Hiragino Sans","Noto Sans JP",system-ui,sans-serif;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#12161b; --surface:#1b2128; --fg:#e7ebf0; --muted:#9aa5b2; --line:#2c343e;
+  --accent:#e0a246; --accent-ink:#1b1408; --rec:#ef5b4f; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#12161b; --surface:#1b2128; --fg:#e7ebf0; --muted:#9aa5b2; --line:#2c343e;
+  --accent:#e0a246; --accent-ink:#1b1408; --rec:#ef5b4f; color-scheme:dark}
+html,body{background:var(--bg);color:var(--fg)}
+body{font-family:var(--body);font-size:15px;line-height:1.6;
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:20px 40px}
+.wrap{max-width:440px;margin:0 auto;display:flex;flex-direction:column;gap:20px}
+h1{font-size:15px;font-weight:700;margin:0;letter-spacing:.04em;color:var(--muted)}
+.readout{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:22px 18px;display:flex;flex-direction:column;align-items:center;gap:6px}
+.note{font-family:var(--mono);font-weight:600;font-size:64px;line-height:1;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.hz{font-family:var(--mono);font-size:14px;color:var(--muted);font-variant-numeric:tabular-nums}
+.meter{position:relative;width:100%;max-width:280px;height:6px;background:var(--line);border-radius:3px;margin-top:10px}
+.meter::after{content:"";position:absolute;left:50%;top:-4px;width:2px;height:14px;background:var(--muted);transform:translateX(-1px)}
+.needle{position:absolute;top:-3px;width:12px;height:12px;border-radius:50%;background:var(--accent);left:50%;transform:translateX(-6px);transition:left .08s linear}
+.cents{font-family:var(--mono);font-size:12px;color:var(--muted)}
+.rec{appearance:none;border:0;cursor:pointer;align-self:center;width:96px;height:96px;border-radius:50%;
+  background:var(--rec);color:#fff;font:700 15px var(--body);box-shadow:0 0 0 6px color-mix(in srgb,var(--rec) 18%,transparent)}
+.rec.on{animation:pulse 1s ease-in-out infinite}
+.rec:focus-visible,button:focus-visible,label.btn:focus-within{outline:3px solid var(--accent);outline-offset:3px}
+@keyframes pulse{50%{box-shadow:0 0 0 14px color-mix(in srgb,var(--rec) 10%,transparent)}}
+@media (prefers-reduced-motion:reduce){.rec.on{animation:none}.needle{transition:none}}
+.status{text-align:center;color:var(--muted);font-size:13px;min-height:1.6em;margin:0}
+.fallback{display:flex;flex-direction:column;gap:8px;align-items:center;text-align:center;font-size:13px;color:var(--muted)}
+.btn{display:inline-flex;align-items:center;gap:6px;cursor:pointer;border:1px solid var(--line);background:var(--surface);color:var(--fg);border-radius:999px;padding:8px 16px;font:600 14px var(--body)}
+.btn input{position:absolute;opacity:0;width:1px;height:1px}
+h2{font-size:13px;font-weight:700;letter-spacing:.06em;color:var(--muted);margin:0 0 8px}
+ul{list-style:none;margin:0;padding:0;border-top:1px solid var(--line)}
+li{display:grid;grid-template-columns:auto 1fr auto auto;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}
+.n{font-family:var(--mono);font-weight:600;font-size:22px;min-width:3.2em}
+.meta{font-family:var(--mono);font-size:12px;color:var(--muted);min-width:0}
+.play{appearance:none;border:0;cursor:pointer;background:var(--accent);color:var(--accent-ink);border-radius:999px;padding:8px 16px;font:700 14px var(--body)}
+.del{appearance:none;border:0;background:none;color:var(--muted);cursor:pointer;font-size:18px;padding:4px 6px}
+.empty{color:var(--muted);font-size:13px;padding:12px 0;border-bottom:1px solid var(--line)}
+</style>
+
+<div class="wrap">
+  <h1>音程メモ</h1>
+
+  <section class="readout" aria-live="polite">
+    <div class="note" id="note">A4</div>
+    <div class="hz" id="hz">440.0 Hz</div>
+    <div class="meter" aria-hidden="true"><div class="needle" id="needle"></div></div>
+    <div class="cents" id="cents">±0 cent</div>
+  </section>
+
+  <button class="rec" id="rec" type="button">録音</button>
+  <p class="status" id="status">タップで録音開始、もう一度タップで停止（最大5秒）</p>
+
+  <div class="fallback" id="fallback" hidden>
+    <span>この画面ではマイクが使えません。録音した音声ファイルから音程を取れます。</span>
+    <label class="btn">音声ファイルを選ぶ<input id="file" type="file" accept="audio/*"></label>
+  </div>
+
+  <section>
+    <h2>保存した音程</h2>
+    <ul id="list"></ul>
+  </section>
+</div>
+
+<script>
+const NAMES=["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+const $=id=>document.getElementById(id);
+let ctx=null, stream=null, analyser=null, raf=0, timer=0, samples=[], recording=false;
+
+const midiOf=hz=>69+12*Math.log2(hz/440);
+function label(hz){const m=midiOf(hz),r=Math.round(m);return{name:NAMES[(r%12+12)%12]+(Math.floor(r/12)-1),cents:Math.round((m-r)*100)}}
+function show(hz){
+  if(!hz){return}
+  const l=label(hz);
+  $("note").textContent=l.name; $("hz").textContent=hz.toFixed(1)+" Hz";
+  $("cents").textContent=(l.cents>0?"+":l.cents<0?"−":"±")+Math.abs(l.cents)+" cent";
+  $("needle").style.left=(50+l.cents)+"%";
+}
+
+// YIN pitch detection on one frame
+function detect(buf,sr){
+  let rms=0;for(let i=0;i<buf.length;i++)rms+=buf[i]*buf[i];
+  if(Math.sqrt(rms/buf.length)<0.01)return 0;
+  const minT=Math.floor(sr/1500), maxT=Math.min(Math.floor(sr/50),buf.length>>1), W=buf.length-maxT;
+  const d=new Float32Array(maxT+1);
+  for(let t=1;t<=maxT;t++){let s=0;for(let i=0;i<W;i++){const x=buf[i]-buf[i+t];s+=x*x}d[t]=s}
+  let run=0,tau=-1;const c=new Float32Array(maxT+1);c[0]=1;
+  for(let t=1;t<=maxT;t++){run+=d[t];c[t]=run?d[t]*t/run:1}
+  for(let t=minT;t<maxT;t++){if(c[t]<0.15){while(t+1<maxT&&c[t+1]<c[t])t++;tau=t;break}}
+  if(tau<0)return 0;
+  const a=c[tau-1],b=c[tau],g=c[tau+1],den=a-2*b+g;
+  const shift=den?(a-g)/(2*den):0;
+  return sr/(tau+shift);
+}
+function median(arr){if(!arr.length)return 0;const m=arr.map(midiOf).sort((x,y)=>x-y);const v=m[m.length>>1];return 440*Math.pow(2,(v-69)/12)}
+
+function getCtx(){if(!ctx)ctx=new (window.AudioContext||window.webkitAudioContext)();if(ctx.state==="suspended")ctx.resume();return ctx}
+
+async function start(){
+  const c=getCtx();
+  try{stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}})}
+  catch(e){$("status").textContent="マイクを使えませんでした。下のファイル選択を使ってください。";$("fallback").hidden=false;return}
+  const src=c.createMediaStreamSource(stream);
+  analyser=c.createAnalyser();analyser.fftSize=4096;src.connect(analyser);
+  const buf=new Float32Array(analyser.fftSize);
+  samples=[];recording=true;$("rec").classList.add("on");$("rec").textContent="停止";
+  $("status").textContent="録音中… 声や楽器で音を出してください";
+  const loop=()=>{analyser.getFloatTimeDomainData(buf);const hz=detect(buf,c.sampleRate);if(hz){samples.push(hz);show(hz)}raf=requestAnimationFrame(loop)};
+  loop();timer=setTimeout(stop,5000);
+}
+function stop(){
+  if(!recording)return;recording=false;
+  cancelAnimationFrame(raf);clearTimeout(timer);
+  stream&&stream.getTracks().forEach(t=>t.stop());
+  $("rec").classList.remove("on");$("rec").textContent="録音";
+  finish(samples);
+}
+function finish(list){
+  const hz=median(list);
+  if(!hz){$("status").textContent="音程を検出できませんでした。もう少し大きく、まっすぐ伸ばした音で試してください。";return}
+  show(hz);add(hz);
+  $("status").textContent=label(hz).name+" を保存しました";
+}
+$("rec").addEventListener("click",()=>recording?stop():start());
+
+$("file").addEventListener("change",async e=>{
+  const f=e.target.files[0];if(!f)return;
+  $("status").textContent="解析中…";
+  try{
+    const c=getCtx();const ab=await c.decodeAudioData(await f.arrayBuffer());
+    const data=ab.getChannelData(0),N=2048,hop=1024,out=[];
+    const end=Math.min(data.length,ab.sampleRate*20);
+    for(let i=0;i+N<end;i+=hop){const hz=detect(data.subarray(i,i+N),ab.sampleRate);if(hz)out.push(hz)}
+    finish(out);
+  }catch(err){$("status").textContent="このファイルは読み込めませんでした。m4a / mp3 / wav を試してください。"}
+  e.target.value="";
+});
+
+// saved pitches
+let saved=[];
+try{saved=JSON.parse(localStorage.getItem("pitch-memo")||"[]")}catch(e){}
+if(!saved.length)saved=[{hz:440,t:"例"},{hz:261.63,t:"例"}];
+function persist(){try{localStorage.setItem("pitch-memo",JSON.stringify(saved))}catch(e){}}
+function add(hz){const d=new Date();saved.unshift({hz,t:d.toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"})});saved=saved.filter(s=>s.t!=="例");persist();render()}
+function render(){
+  const ul=$("list");ul.textContent="";
+  if(!saved.length){const p=document.createElement("li");p.className="empty";p.textContent="まだありません。録音すると音程がここに残ります。";ul.appendChild(p);return}
+  saved.forEach((s,i)=>{
+    const li=document.createElement("li");const l=label(s.hz);
+    const n=document.createElement("span");n.className="n";n.textContent=l.name;
+    const m=document.createElement("span");m.className="meta";m.textContent=s.hz.toFixed(1)+" Hz · "+s.t;
+    const p=document.createElement("button");p.className="play";p.type="button";p.textContent="▶ 鳴らす";p.onclick=()=>{play(s.hz);show(s.hz)};
+    const x=document.createElement("button");x.className="del";x.type="button";x.setAttribute("aria-label","削除");x.textContent="×";
+    x.onclick=()=>{saved.splice(i,1);persist();render()};
+    li.append(n,m,p,x);ul.appendChild(li);
+  });
+}
+function play(hz){
+  const c=getCtx(),o=c.createOscillator(),g=c.createGain(),t=c.currentTime;
+  o.type="triangle";o.frequency.value=hz;
+  g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(0.35,t+0.02);g.gain.setTargetAtTime(0,t+1.2,0.15);
+  o.connect(g).connect(c.destination);o.start(t);o.stop(t+2);
+}
+if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)$("fallback").hidden=false;
+render();
+</script>
+
+</body>
+</html>
