@@ -59,6 +59,7 @@ li{display:grid;grid-template-columns:1fr auto auto;align-items:center;gap:12px;
 .knob{display:grid;grid-template-columns:7.5em 1fr 3.2em;align-items:center;gap:10px;font-size:13px;color:var(--muted)}
 .knob output{font-family:var(--mono);font-size:12px;text-align:right;color:var(--fg)}
 .knob input{width:100%;accent-color:var(--accent)}
+.knob select{grid-column:2/4;font:600 14px var(--body);color:var(--fg);background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:6px 8px}
 .roll{width:100%;height:150px;display:block;margin-top:6px;border-radius:8px;background:color-mix(in srgb,var(--line) 35%,transparent)}
 .seq{font-family:var(--mono);font-size:13px;color:var(--muted);text-align:center;word-break:break-word;min-height:1.6em}
 .seq b{color:var(--fg);font-weight:600}.seq b.now{color:var(--accent)}
@@ -84,6 +85,7 @@ li .txt{min-width:0;display:flex;flex-direction:column}
     <label class="knob">録音の音量<input id="inGain" type="range" min="0" max="100" step="1"><output id="inGainV"></output></label>
     <label class="knob">再生の音量<input id="outGain" type="range" min="0" max="300" step="10"><output id="outGainV"></output></label>
     <label class="knob">再生の高さ<input id="oct" type="range" min="-1" max="2" step="1"><output id="octV"></output></label>
+    <label class="knob">再生の音色<select id="tone"><option value="saw">ふつう</option><option value="p2">第二ピークも鳴らす</option></select><span></span></label>
   </section>
 
   <div class="fallback" id="fallback" hidden>
@@ -127,20 +129,40 @@ function detect(buf,sr){
   return sr/(tau+shift);
 }
 
-// frames [{t, m, r}] (m = fractional midi, 0 = unvoiced; r = rms) -> notes [{m, s, d}]
-function segment(fr){
+// Strength of the first 10 harmonics (k × f0) in one frame: Hann window + Goertzel at each multiple
+const hannCache={};
+function harmonics(buf,sr,hz){
+  const N=buf.length,w=hannCache[N]||(hannCache[N]=Float32Array.from({length:N},(_,i)=>0.5-0.5*Math.cos(2*Math.PI*i/(N-1)))),out=[];
+  for(let k=1;k<=10;k++){
+    const f=k*hz;if(f>sr*0.45){out.push(0);continue}
+    const c=2*Math.cos(2*Math.PI*f/sr);let s1=0,s2=0;
+    for(let i=0;i<N;i++){const s0=buf[i]*w[i]+c*s1-s2;s2=s1;s1=s0}
+    out.push(Math.sqrt(Math.max(0,s1*s1+s2*s2-c*s1*s2)));
+  }
+  return out;
+}
+
+// frames [{t, m, r, h}] (m = fractional midi, 0 = unvoiced; r = rms) -> notes [{m, s, d}]
+function segment(fr,zones=[]){
   if(fr.length<3)return[];
   const dt=med(fr.slice(1).map((f,i)=>f.t-fr[i].t))||0.02, gap=Math.max(0.07,dt*2.5);
   const sm=fr.map((f,i)=>{if(!f.m)return 0;const w=[];for(let k=i-2;k<=i+2;k++)if(fr[k]&&fr[k].m)w.push(fr[k].m);return w.length>=3?med(w):0});
+  // inside vibrato, follow the centre of the swing (average over one cycle) so a wide vibrato stays one note
+  const zoneAt=t=>zones.find(z=>t>=z.s&&t<=z.e);
+  const inVib=fr.map(f=>!!zoneAt(f.t));
+  const cen=sm.map((v,i)=>{if(!v||!inVib[i])return v;const z=zoneAt(fr[i].t);let a=0,c=0;
+    for(let k=i;k>=0&&fr[i].t-fr[k].t<=z.per/2;k--)if(sm[k]){a+=sm[k];c++}
+    for(let k=i+1;k<fr.length&&fr[k].t-fr[i].t<=z.per/2;k++)if(sm[k]){a+=sm[k];c++}
+    return a/c});
   const raw=[];let cur=null;
   const close=()=>{if(!cur)return;const d=cur.last-cur.s+dt;if(d>=0.09)raw.push({m:Math.round(med(cur.v)),s:cur.s,d,re:cur.re});cur=null};
   fr.forEach((f,i)=>{
-    const v=sm[i];
+    const v=cen[i];
     if(!v){if(cur){if(f.t-cur.last>gap)close();else if(f.t-cur.last>=0.06)cur.dip=true}return}
     const r=f.r||0;
     if(cur&&f.t-cur.last<=gap&&Math.abs(v-med(cur.v.slice(-15)))<0.7){
       // a dip in volume followed by a rise means the same pitch was sung again
-      if(r<cur.peak*0.45)cur.dip=true;
+      if(r<cur.peak*0.45&&!inVib[i])cur.dip=true;
       if(!(cur.dip&&r>cur.peak*0.7&&f.t-cur.s>0.12)){cur.v.push(v);cur.last=f.t;cur.peak=Math.max(cur.peak,r);return}
     }
     const re=!!(cur&&cur.dip&&f.t-cur.last<=gap);close();cur={s:f.t,last:f.t,v:[v],peak:r,dip:false,re};
@@ -157,39 +179,66 @@ function segment(fr){
     }
     fixed.push(n);
   });
+  // averaging across the end of a vibrato can leave a short in-between pitch: fold it into the vibrato note
+  const kept=[];
+  fixed.forEach((n,i)=>{
+    const p=kept[kept.length-1],q=fixed[i+1],z=zones.find(z=>n.s<z.e&&n.s+n.d>z.s);
+    if(z&&p&&q&&n.d<z.per&&(n.m-p.m)*(q.m-n.m)>0&&(zoneAt(p.s+p.d-0.05)||zoneAt(q.s+0.05))){p.d=n.s+n.d-p.s;return}
+    kept.push(n);
+  });
   const out=[];
-  for(const n of fixed){const p=out[out.length-1];if(p&&p.m===n.m&&!n.re&&n.s-(p.s+p.d)<0.15)p.d=n.s+n.d-p.s;else out.push({...n})}
+  for(const n of kept){const p=out[out.length-1];if(p&&p.m===n.m&&!n.re&&n.s-(p.s+p.d)<0.15)p.d=n.s+n.d-p.s;else out.push({...n})}
   return legato(out);
 }
 
 // frames -> {notes, curve}: notes start at 0, curve is the sung pitch as [[t·100, midi·100], …]
 function analyze(fr){
-  const notes=segment(fr);if(!notes.length)return{notes,curve:[]};
-  const base=notes[0].s,end=notes[notes.length-1].s+notes[notes.length-1].d;
   // 3-point median removes single-frame octave spikes without flattening vibrato
-  const pts=[];
-  fr.forEach((f,i)=>{if(!f.m||f.t<base-0.05||f.t>end+0.05)return;const w=[fr[i-1],f,fr[i+1]].filter(x=>x&&x.m).map(x=>x.m);pts.push({t:f.t-base,m:w.length===3?med(w):f.m})});
-  const out=notes.map(n=>{const o={m:n.m,s:+(n.s-base).toFixed(3),d:+n.d.toFixed(3)};const v=vibrato(pts,o);if(v)o.vib=v;return o});
+  const all=[];
+  fr.forEach((f,i)=>{if(!f.m)return;const w=[fr[i-1],f,fr[i+1]].filter(x=>x&&x.m).map(x=>x.m);all.push({t:f.t,m:w.length===3?med(w):f.m})});
+  const zones=vibZones(all);
+  const notes=segment(fr,zones);if(!notes.length)return{notes,curve:[]};
+  const base=notes[0].s,end=notes[notes.length-1].s+notes[notes.length-1].d;
+  const pts=all.filter(p=>p.t>=base-0.05&&p.t<=end+0.05).map(p=>({t:p.t-base,m:p.m}));
+  const out=notes.map(n=>{
+    const o={m:n.m,s:+(n.s-base).toFixed(3),d:+n.d.toFixed(3)};
+    // the vibrato stretch that overlaps this note the most, clipped to the note
+    let best=null,bo=0.2;
+    for(const z of zones){const ov=Math.min(z.e,n.s+n.d)-Math.max(z.s,n.s);if(ov>bo){bo=ov;best=z}}
+    if(best)o.vib={s:+(Math.max(best.s,n.s)-base).toFixed(2),e:+(Math.min(best.e,n.s+n.d)-base).toFixed(2),rate:best.rate,depth:best.depth};
+    // voice colour: average harmonic strengths over the note; the second peak is the strongest one after the fundamental
+    const hs=fr.filter(f=>f.h&&f.t>=n.s&&f.t<=n.s+n.d&&Math.abs(f.m-n.m)<3).map(f=>f.h);
+    if(hs.length>=3){
+      const avg=hs[0].map((_,k)=>hs.reduce((a,h)=>a+h[k],0)/hs.length),mx=Math.max(...avg);
+      if(mx>0){
+        o.h=avg.map(v=>+(v/mx).toFixed(2));
+        let k2=1;for(let k=2;k<avg.length;k++)if(avg[k]>avg[k2])k2=k;
+        if(avg[k2]>0&&avg[0]>0)o.p2={k:k2+1,a:+Math.min(4,avg[k2]/avg[0]).toFixed(2)};
+      }
+    }
+    return o});
   const curve=[];let lastT=-1;
   for(const p of pts){if(p.t-lastT<0.019)continue;lastT=p.t;curve.push([Math.round(p.t*100),Math.round(p.m*100)])}
   return{notes:out,curve};
 }
 const curvePts=c=>(c||[]).map(([t,m])=>({t:t/100,m:m/100}));
 
-// Vibrato: within a held note, the pitch swings regularly at 4–8.5 Hz by at least ~30 cents peak to peak.
-// Returns {s, e, rate, depth} (seconds from melody start, Hz, cents peak-to-peak) or null.
-function vibrato(pts,n){
-  if(n.d<0.4)return null;
-  const seg=pts.filter(p=>p.t>=n.s+0.06&&p.t<=n.s+n.d-0.03);
-  if(seg.length<8)return null;
-  // resample to 100 Hz, refusing to bridge gaps longer than 80 ms
-  const xs=[];let j=0;
-  for(let t=seg[0].t;t<=seg[seg.length-1].t;t+=0.01){
+// Vibrato: stretches where the pitch swings regularly at 4–8.5 Hz by 0.3–5 semitones peak to peak.
+// pts [{t, m}] -> zones [{s, e, rate, depth, per}] (seconds, Hz, cents peak-to-peak, period in seconds)
+function vibZones(pts){
+  const zones=[];let run=[];
+  const flush=()=>{if(run.length>1&&run[run.length-1].t-run[0].t>=0.35)zones.push(...zonesIn(run));run=[]};
+  for(const p of pts){if(run.length&&p.t-run[run.length-1].t>0.08)flush();run.push(p)}
+  flush();return zones;
+}
+function zonesIn(seg){
+  // resample to 100 Hz
+  const xs=[],t0=seg[0].t;let j=0;
+  for(let t=t0;t<=seg[seg.length-1].t;t+=0.01){
     while(j<seg.length-2&&seg[j+1].t<t)j++;
-    const a=seg[j],b=seg[j+1]||a;if(b.t-a.t>0.08)return null;
-    xs.push(b.t>a.t?a.m+(b.m-a.m)*(t-a.t)/(b.t-a.t):a.m);
+    const a=seg[j],b=seg[j+1]||a;xs.push(b.t>a.t?a.m+(b.m-a.m)*(t-a.t)/(b.t-a.t):a.m);
   }
-  // remove the slow pitch drift with a 0.2 s moving average (≈ one vibrato cycle)
+  // remove the slow pitch movement with a 0.2 s moving average (≈ one vibrato cycle)
   const H=10,x=xs.map((_,i)=>{let s=0,c=0;for(let k=Math.max(0,i-H);k<=Math.min(xs.length-1,i+H);k++){s+=xs[k];c++}return xs[i]-s/c});
   // alternating peaks/troughs with hysteresis
   const ext=[];let dir=0,hi=0,lo=0;
@@ -198,18 +247,29 @@ function vibrato(pts,n){
     if(dir>=0&&x[hi]-x[i]>0.12){ext.push(hi);dir=-1;lo=i}
     else if(dir<=0&&x[i]-x[lo]>0.12){ext.push(lo);dir=1;hi=i}
   }
-  // longest run of half-cycles that look like vibrato
-  let best=null,run=[];
-  const ok=(a,b)=>{const h=(b-a)/100;return h>=1/(2*8.5)&&h<=1/(2*4)&&Math.abs(x[b]-x[a])>=0.3&&Math.abs(x[b]-x[a])<=3};
+  // runs of half-cycles with vibrato speed and width, each about as wide as the one before
+  // (single half-cycles get some slack for frame timing jitter; the average rate is checked below)
+  const amp=(a,b)=>Math.abs(x[b]-x[a]);
+  const ok=(k)=>{if(!ok0(k))return false;const A=amp(ext[k-1],ext[k]);
+    if(k>=2&&ok0(k-1)){const r=A/amp(ext[k-2],ext[k-1]);if(r<0.4||r>2.5)return false}return true};
+  // vibrato swings around a steady centre; a run of quick steps (a scale) has a centre that keeps moving
+  const ctr=i=>xs[i]-x[i];
+  const ok0=(k)=>{const h=(ext[k]-ext[k-1])/100,A=amp(ext[k-1],ext[k]);return h>=0.04&&h<=0.19&&A>=0.3&&A<=5&&Math.abs(ctr(ext[k])-ctr(ext[k-1]))<Math.max(0.4,A*0.3)};
+  const out=[];let r=[];
   for(let k=1;k<=ext.length;k++){
-    if(k<ext.length&&ok(ext[k-1],ext[k])){if(!run.length)run.push(ext[k-1]);run.push(ext[k]);continue}
-    if(run.length>=5&&(!best||run.length>best.length))best=run;run=[];
+    if(k<ext.length&&ok(k)){if(!r.length)r.push(ext[k-1]);r.push(ext[k]);continue}
+    if(r.length>=5){
+      // regularity is judged on full cycles, which cancels most of the frame jitter of single peaks
+      const mh=(r[r.length-1]-r[0])/(r.length-1),cyc=r.slice(2).map((e,i)=>e-r[i]);
+      const mc=cyc.reduce((a,b)=>a+b)/cyc.length,cv=Math.sqrt(cyc.reduce((a,h)=>a+(h-mc)**2,0)/cyc.length)/mc;
+      if(100/(2*mh)>=4&&100/(2*mh)<=8.5&&cv<=0.25){
+        const depth=r.slice(1).reduce((a,e,i)=>a+amp(r[i],e),0)/(r.length-1);
+        out.push({s:t0+(r[0]-mh)/100,e:t0+(r[r.length-1]+mh)/100,rate:+(100/(2*mh)).toFixed(1),depth:Math.round(depth*100),per:2*mh/100});
+      }
+    }
+    r=k<ext.length&&ok0(k)?[ext[k-1],ext[k]]:[];
   }
-  if(!best)return null;
-  const halves=best.slice(1).map((e,i)=>e-best[i]),mh=halves.reduce((a,b)=>a+b)/halves.length;
-  if(Math.sqrt(halves.reduce((a,h)=>a+(h-mh)**2,0)/halves.length)/mh>0.35)return null;
-  const t0=seg[0].t,depth=best.slice(1).reduce((a,e,i)=>a+Math.abs(x[e]-x[best[i]]),0)/(best.length-1);
-  return{s:+(t0+best[0]/100).toFixed(2),e:+(t0+best[best.length-1]/100).toFixed(2),rate:+(100/(2*mh)).toFixed(1),depth:Math.round(depth*100)};
+  return out;
 }
 // sung notes run into each other: stretch each note over short gaps (consonants, breaths)
 function legato(notes){
@@ -219,7 +279,7 @@ function legato(notes){
 function getCtx(){if(!ctx)ctx=new (window.AudioContext||window.webkitAudioContext)();if(ctx.state==="suspended")ctx.resume();return ctx}
 
 // volume settings: input gain ×1–×20 on a log slider, output 0–150 %
-let prefs={in:46,out:150,oct:0};
+let prefs={in:46,out:150,oct:0,tone:"saw"};
 try{Object.assign(prefs,JSON.parse(localStorage.getItem("pitch-memo-prefs")||"{}"))}catch(e){}
 const inMul=()=>Math.pow(20,prefs.in/100);
 let inNode=null,outNode=null;
@@ -233,7 +293,7 @@ function outBus(){
 // after the mic is used iOS keeps routing audio to the quiet call speaker unless told otherwise
 function audioMode(type){try{if(navigator.audioSession)navigator.audioSession.type=type}catch(e){}}
 function syncPrefs(){
-  $("inGain").value=prefs.in;$("outGain").value=prefs.out;$("oct").value=prefs.oct;
+  $("inGain").value=prefs.in;$("outGain").value=prefs.out;$("oct").value=prefs.oct;$("tone").value=prefs.tone;
   $("octV").textContent=prefs.oct?(prefs.oct>0?"+":"−")+Math.abs(prefs.oct)+"oct":"±0";
   $("inGainV").textContent="×"+inMul().toFixed(1);$("outGainV").textContent=prefs.out+"%";
   if(inNode)inNode.gain.value=inMul();if(outNode)outNode.gain.value=prefs.out/100;
@@ -242,6 +302,7 @@ function syncPrefs(){
 $("inGain").addEventListener("input",e=>{prefs.in=+e.target.value;syncPrefs()});
 $("outGain").addEventListener("input",e=>{prefs.out=+e.target.value;syncPrefs()});
 $("oct").addEventListener("input",e=>{prefs.oct=+e.target.value;syncPrefs()});
+$("tone").addEventListener("change",e=>{prefs.tone=e.target.value;syncPrefs()});
 syncPrefs();
 function level(r){
   const el=$("level"),w=Math.min(100,Math.sqrt(r/0.3)*100);
@@ -275,9 +336,10 @@ function showMelody(item,cur,head){
   const seq=$("seq");seq.textContent="";
   notes.forEach((n,i)=>{const b=document.createElement("b");b.textContent=nameOf(n.m)+(n.vib?"〜":"");if(n.vib)b.title="ビブラート "+n.vib.rate+"Hz・幅"+n.vib.depth+"セント";if(i===cur)b.className="now";seq.append(b," ")});
   $("note").textContent=cur!=null&&notes[cur]?nameOf(notes[cur].m):notes.length+"音";
+  const p2=cur!=null&&notes[cur]&&notes[cur].p2;
   const dur=notes.length?notes[notes.length-1].s+notes[notes.length-1].d:0;
   const nv=notes.filter(n=>n.vib).length;
-  $("hz").textContent=dur.toFixed(1)+" 秒"+(nv?" · 〜 ビブラート":"");
+  $("hz").textContent=p2&&prefs.tone==="p2"?"＋ "+nameOf(notes[cur].m+12*Math.log2(p2.k))+"（"+p2.k+"倍音・強さ "+Math.round(p2.a*100)+"%）":dur.toFixed(1)+" 秒"+(nv?" · 〜 ビブラート":"");
   draw(notes,curvePts(item.curve),head);
 }
 
@@ -296,7 +358,7 @@ async function start(){
   let last=-1;
   const loop=()=>{
     const t=c.currentTime-t0;
-    if(t!==last){last=t;analyser.getFloatTimeDomainData(buf);const hz=detect(buf,c.sampleRate),r=rmsOf(buf),m=hz?midiOf(hz):0;frames.push({t,m,r});level(r);
+    if(t!==last){last=t;analyser.getFloatTimeDomainData(buf);const hz=detect(buf,c.sampleRate),r=rmsOf(buf),m=hz?midiOf(hz):0;frames.push({t,m,r,h:hz?harmonics(buf,c.sampleRate,hz):null});level(r);
       $("note").textContent=m?nameOf(m):"…";$("hz").textContent=t.toFixed(1)+" 秒";draw(null,frames,null,true)}
     raf=requestAnimationFrame(loop)};
   loop();timer=setTimeout(stop,MAX_SEC*1000);
@@ -325,7 +387,7 @@ $("file").addEventListener("change",async e=>{
     const c=getCtx();const ab=await c.decodeAudioData(await f.arrayBuffer());
     const data=ab.getChannelData(0),sr=ab.sampleRate,N=2048,hop=Math.round(sr*0.02),out=[];
     const end=Math.min(data.length,sr*MAX_SEC);
-    for(let i=0;i+N<end;i+=hop){const b=data.slice(i,i+N).map(x=>x*inMul()),hz=detect(b,sr);out.push({t:i/sr,m:hz?midiOf(hz):0,r:rmsOf(b)})}
+    for(let i=0;i+N<end;i+=hop){const b=data.slice(i,i+N).map(x=>x*inMul()),hz=detect(b,sr);out.push({t:i/sr,m:hz?midiOf(hz):0,r:rmsOf(b),h:hz?harmonics(b,sr,hz):null})}
     finish(out);
   }catch(err){$("status").textContent="このファイルは読み込めませんでした。m4a / mp3 / wav を試してください。"}
   e.target.value="";
@@ -343,10 +405,18 @@ function playMelody(item){
   const c=getCtx(),t0=c.currentTime+0.08,notes=legato(item.notes);
   for(const n of notes){
     // sawtooth through a low-pass: rich in overtones so low notes still carry on a phone speaker
-    const f=hzOf(n.m+12*prefs.oct),o=c.createOscillator(),lp=c.createBiquadFilter(),g=c.createGain(),s=t0+n.s,d=Math.max(0.12,n.d);
-    o.type="sawtooth";o.frequency.value=f;lp.type="lowpass";lp.frequency.value=Math.min(5000,f*10);lp.Q.value=0.7;
-    g.gain.setValueAtTime(0,s);g.gain.linearRampToValueAtTime(0.35,s+0.02);g.gain.setValueAtTime(0.35,s+d-0.03);g.gain.linearRampToValueAtTime(0,s+d);
-    o.connect(lp).connect(g).connect(outBus());o.start(s);o.stop(s+d+0.02);voices.push(o);
+    const f=hzOf(n.m+12*prefs.oct),s=t0+n.s,d=Math.max(0.12,n.d);
+    const env=level=>{const g=c.createGain();g.gain.setValueAtTime(0,s);g.gain.linearRampToValueAtTime(level,s+0.02);g.gain.setValueAtTime(level,s+d-0.03);g.gain.linearRampToValueAtTime(0,s+d);g.connect(outBus());return g};
+    const osc=(type,freq,dest)=>{const o=c.createOscillator();o.type=type;o.frequency.value=freq;o.connect(dest);o.start(s);o.stop(s+d+0.02);voices.push(o);return o};
+    if(prefs.tone==="p2"){
+      // two pure tones: the sung pitch and the voice's second-strongest component, at their measured balance
+      const a=n.p2?n.p2.a:0,sum=1+a;
+      osc("sine",f,env(0.5/sum));
+      if(n.p2&&f*n.p2.k<c.sampleRate/2)osc("sine",f*n.p2.k,env(0.5*a/sum));
+    }else{
+      const lp=c.createBiquadFilter();lp.type="lowpass";lp.frequency.value=Math.min(5000,f*10);lp.Q.value=0.7;lp.connect(env(0.35));
+      osc("sawtooth",f,lp);
+    }
   }
   playing=item;render();
   const end=notes[notes.length-1].s+notes[notes.length-1].d;
