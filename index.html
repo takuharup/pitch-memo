@@ -82,7 +82,8 @@ li .txt{min-width:0;display:flex;flex-direction:column}
 
   <section class="knobs">
     <label class="knob">録音の音量<input id="inGain" type="range" min="0" max="100" step="1"><output id="inGainV"></output></label>
-    <label class="knob">再生の音量<input id="outGain" type="range" min="0" max="150" step="5"><output id="outGainV"></output></label>
+    <label class="knob">再生の音量<input id="outGain" type="range" min="0" max="300" step="10"><output id="outGainV"></output></label>
+    <label class="knob">再生の高さ<input id="oct" type="range" min="-1" max="2" step="1"><output id="octV"></output></label>
   </section>
 
   <div class="fallback" id="fallback" hidden>
@@ -135,7 +136,7 @@ function segment(fr){
   const close=()=>{if(!cur)return;const d=cur.last-cur.s+dt;if(d>=0.09)raw.push({m:Math.round(med(cur.v)),s:cur.s,d,re:cur.re});cur=null};
   fr.forEach((f,i)=>{
     const v=sm[i];
-    if(!v){if(cur){if(f.t-cur.last>gap)close();else cur.dip=true}return}
+    if(!v){if(cur){if(f.t-cur.last>gap)close();else if(f.t-cur.last>=0.06)cur.dip=true}return}
     const r=f.r||0;
     if(cur&&f.t-cur.last<=gap&&Math.abs(v-med(cur.v.slice(-15)))<0.7){
       // a dip in volume followed by a rise means the same pitch was sung again
@@ -145,28 +146,53 @@ function segment(fr){
     const re=!!(cur&&cur.dip&&f.t-cur.last<=gap);close();cur={s:f.t,last:f.t,v:[v],peak:r,dip:false,re};
   });
   close();
+  // short notes an octave off their neighbours are detection slips; short lone leaps are glitches
+  const fixed=[];
+  raw.forEach((n,i)=>{
+    const p=raw[i-1],q=raw[i+1];
+    if(n.d<0.25&&(p||q)){
+      const ref=p&&q?(p.m+q.m)/2:(p||q).m;
+      if(Math.abs(n.m-12-ref)<3)n.m-=12;else if(Math.abs(n.m+12-ref)<3)n.m+=12;
+      else if(n.d<0.15&&p&&q&&Math.abs(n.m-p.m)>=7&&Math.abs(n.m-q.m)>=7)return;
+    }
+    fixed.push(n);
+  });
   const out=[];
-  for(const n of raw){const p=out[out.length-1];if(p&&p.m===n.m&&!n.re&&n.s-(p.s+p.d)<0.03)p.d=n.s+n.d-p.s;else out.push({...n})}
+  for(const n of fixed){const p=out[out.length-1];if(p&&p.m===n.m&&!n.re&&n.s-(p.s+p.d)<0.15)p.d=n.s+n.d-p.s;else out.push({...n})}
   const base=out.length?out[0].s:0;
-  return out.map(n=>({m:n.m,s:+(n.s-base).toFixed(3),d:+n.d.toFixed(3)}));
+  return legato(out.map(n=>({m:n.m,s:+(n.s-base).toFixed(3),d:+n.d.toFixed(3)})));
+}
+// sung notes run into each other: stretch each note over short gaps (consonants, breaths)
+function legato(notes){
+  return notes.map((n,i)=>{const q=notes[i+1];if(!q)return n;const gap=q.s-(n.s+n.d);return gap>0&&gap<0.35?{...n,d:+(q.s-n.s).toFixed(3)}:n});
 }
 
 function getCtx(){if(!ctx)ctx=new (window.AudioContext||window.webkitAudioContext)();if(ctx.state==="suspended")ctx.resume();return ctx}
 
 // volume settings: input gain ×1–×20 on a log slider, output 0–150 %
-let prefs={in:46,out:100};
+let prefs={in:46,out:150,oct:0};
 try{Object.assign(prefs,JSON.parse(localStorage.getItem("pitch-memo-prefs")||"{}"))}catch(e){}
 const inMul=()=>Math.pow(20,prefs.in/100);
 let inNode=null,outNode=null;
-function outBus(){const c=getCtx();if(!outNode){outNode=c.createGain();outNode.connect(c.destination)}outNode.gain.value=prefs.out/100;return outNode}
+// a compressor lets the volume go well past 100% without clipping on phone speakers
+function outBus(){
+  const c=getCtx();
+  if(!outNode){const comp=c.createDynamicsCompressor();comp.threshold.value=-18;comp.knee.value=12;comp.ratio.value=6;comp.attack.value=0.003;comp.release.value=0.15;
+    outNode=c.createGain();outNode.connect(comp).connect(c.destination)}
+  outNode.gain.value=prefs.out/100;return outNode;
+}
+// after the mic is used iOS keeps routing audio to the quiet call speaker unless told otherwise
+function audioMode(type){try{if(navigator.audioSession)navigator.audioSession.type=type}catch(e){}}
 function syncPrefs(){
-  $("inGain").value=prefs.in;$("outGain").value=prefs.out;
+  $("inGain").value=prefs.in;$("outGain").value=prefs.out;$("oct").value=prefs.oct;
+  $("octV").textContent=prefs.oct?(prefs.oct>0?"+":"−")+Math.abs(prefs.oct)+"oct":"±0";
   $("inGainV").textContent="×"+inMul().toFixed(1);$("outGainV").textContent=prefs.out+"%";
   if(inNode)inNode.gain.value=inMul();if(outNode)outNode.gain.value=prefs.out/100;
   try{localStorage.setItem("pitch-memo-prefs",JSON.stringify(prefs))}catch(e){}
 }
 $("inGain").addEventListener("input",e=>{prefs.in=+e.target.value;syncPrefs()});
 $("outGain").addEventListener("input",e=>{prefs.out=+e.target.value;syncPrefs()});
+$("oct").addEventListener("input",e=>{prefs.oct=+e.target.value;syncPrefs()});
 syncPrefs();
 function level(r){
   const el=$("level"),w=Math.min(100,Math.sqrt(r/0.3)*100);
@@ -189,6 +215,7 @@ function draw(notes,trace,head){
   if(head!=null){g.fillStyle=mut;g.fillRect(X(head),0,1.5,H)}
 }
 function showMelody(notes,cur){
+  notes=legato(notes);
   shown=notes;
   const seq=$("seq");seq.textContent="";
   notes.forEach((n,i)=>{const b=document.createElement("b");b.textContent=nameOf(n.m);if(i===cur)b.className="now";seq.append(b," ")});
@@ -200,6 +227,7 @@ function showMelody(notes,cur){
 
 async function start(){
   stopPlay();
+  audioMode("play-and-record");
   const c=getCtx();
   try{stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}})}
   catch(e){$("status").textContent="マイクを使えませんでした。下のファイル選択を使ってください。";$("fallback").hidden=false;return}
@@ -221,6 +249,7 @@ function stop(){
   if(!recording)return;recording=false;
   cancelAnimationFrame(raf);clearTimeout(timer);
   stream&&stream.getTracks().forEach(t=>t.stop());level(0);
+  audioMode("playback");
   $("rec").classList.remove("on");$("rec").textContent="録音";
   finish(frames);
 }
@@ -254,12 +283,14 @@ function stopPlay(){
 }
 function playMelody(item){
   stopPlay();
-  const c=getCtx(),t0=c.currentTime+0.05,notes=item.notes;
+  audioMode("playback");
+  const c=getCtx(),t0=c.currentTime+0.08,notes=legato(item.notes);
   for(const n of notes){
-    const o=c.createOscillator(),g=c.createGain(),s=t0+n.s,d=Math.max(0.12,n.d);
-    o.type="triangle";o.frequency.value=hzOf(n.m);
-    g.gain.setValueAtTime(0,s);g.gain.linearRampToValueAtTime(0.3,s+0.015);g.gain.setValueAtTime(0.3,s+d-0.04);g.gain.linearRampToValueAtTime(0,s+d);
-    o.connect(g).connect(outBus());o.start(s);o.stop(s+d+0.02);voices.push(o);
+    // sawtooth through a low-pass: rich in overtones so low notes still carry on a phone speaker
+    const f=hzOf(n.m+12*prefs.oct),o=c.createOscillator(),lp=c.createBiquadFilter(),g=c.createGain(),s=t0+n.s,d=Math.max(0.12,n.d);
+    o.type="sawtooth";o.frequency.value=f;lp.type="lowpass";lp.frequency.value=Math.min(5000,f*10);lp.Q.value=0.7;
+    g.gain.setValueAtTime(0,s);g.gain.linearRampToValueAtTime(0.35,s+0.02);g.gain.setValueAtTime(0.35,s+d-0.03);g.gain.linearRampToValueAtTime(0,s+d);
+    o.connect(lp).connect(g).connect(outBus());o.start(s);o.stop(s+d+0.02);voices.push(o);
   }
   playing=item;render();
   const end=notes[notes.length-1].s+notes[notes.length-1].d;
