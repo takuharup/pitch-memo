@@ -159,8 +159,57 @@ function segment(fr){
   });
   const out=[];
   for(const n of fixed){const p=out[out.length-1];if(p&&p.m===n.m&&!n.re&&n.s-(p.s+p.d)<0.15)p.d=n.s+n.d-p.s;else out.push({...n})}
-  const base=out.length?out[0].s:0;
-  return legato(out.map(n=>({m:n.m,s:+(n.s-base).toFixed(3),d:+n.d.toFixed(3)})));
+  return legato(out);
+}
+
+// frames -> {notes, curve}: notes start at 0, curve is the sung pitch as [[t·100, midi·100], …]
+function analyze(fr){
+  const notes=segment(fr);if(!notes.length)return{notes,curve:[]};
+  const base=notes[0].s,end=notes[notes.length-1].s+notes[notes.length-1].d;
+  // 3-point median removes single-frame octave spikes without flattening vibrato
+  const pts=[];
+  fr.forEach((f,i)=>{if(!f.m||f.t<base-0.05||f.t>end+0.05)return;const w=[fr[i-1],f,fr[i+1]].filter(x=>x&&x.m).map(x=>x.m);pts.push({t:f.t-base,m:w.length===3?med(w):f.m})});
+  const out=notes.map(n=>{const o={m:n.m,s:+(n.s-base).toFixed(3),d:+n.d.toFixed(3)};const v=vibrato(pts,o);if(v)o.vib=v;return o});
+  const curve=[];let lastT=-1;
+  for(const p of pts){if(p.t-lastT<0.019)continue;lastT=p.t;curve.push([Math.round(p.t*100),Math.round(p.m*100)])}
+  return{notes:out,curve};
+}
+const curvePts=c=>(c||[]).map(([t,m])=>({t:t/100,m:m/100}));
+
+// Vibrato: within a held note, the pitch swings regularly at 4–8.5 Hz by at least ~30 cents peak to peak.
+// Returns {s, e, rate, depth} (seconds from melody start, Hz, cents peak-to-peak) or null.
+function vibrato(pts,n){
+  if(n.d<0.4)return null;
+  const seg=pts.filter(p=>p.t>=n.s+0.06&&p.t<=n.s+n.d-0.03);
+  if(seg.length<8)return null;
+  // resample to 100 Hz, refusing to bridge gaps longer than 80 ms
+  const xs=[];let j=0;
+  for(let t=seg[0].t;t<=seg[seg.length-1].t;t+=0.01){
+    while(j<seg.length-2&&seg[j+1].t<t)j++;
+    const a=seg[j],b=seg[j+1]||a;if(b.t-a.t>0.08)return null;
+    xs.push(b.t>a.t?a.m+(b.m-a.m)*(t-a.t)/(b.t-a.t):a.m);
+  }
+  // remove the slow pitch drift with a 0.2 s moving average (≈ one vibrato cycle)
+  const H=10,x=xs.map((_,i)=>{let s=0,c=0;for(let k=Math.max(0,i-H);k<=Math.min(xs.length-1,i+H);k++){s+=xs[k];c++}return xs[i]-s/c});
+  // alternating peaks/troughs with hysteresis
+  const ext=[];let dir=0,hi=0,lo=0;
+  for(let i=1;i<x.length;i++){
+    if(x[i]>x[hi])hi=i;if(x[i]<x[lo])lo=i;
+    if(dir>=0&&x[hi]-x[i]>0.12){ext.push(hi);dir=-1;lo=i}
+    else if(dir<=0&&x[i]-x[lo]>0.12){ext.push(lo);dir=1;hi=i}
+  }
+  // longest run of half-cycles that look like vibrato
+  let best=null,run=[];
+  const ok=(a,b)=>{const h=(b-a)/100;return h>=1/(2*8.5)&&h<=1/(2*4)&&Math.abs(x[b]-x[a])>=0.3&&Math.abs(x[b]-x[a])<=3};
+  for(let k=1;k<=ext.length;k++){
+    if(k<ext.length&&ok(ext[k-1],ext[k])){if(!run.length)run.push(ext[k-1]);run.push(ext[k]);continue}
+    if(run.length>=5&&(!best||run.length>best.length))best=run;run=[];
+  }
+  if(!best)return null;
+  const halves=best.slice(1).map((e,i)=>e-best[i]),mh=halves.reduce((a,b)=>a+b)/halves.length;
+  if(Math.sqrt(halves.reduce((a,h)=>a+(h-mh)**2,0)/halves.length)/mh>0.35)return null;
+  const t0=seg[0].t,depth=best.slice(1).reduce((a,e,i)=>a+Math.abs(x[e]-x[best[i]]),0)/(best.length-1);
+  return{s:+(t0+best[0]/100).toFixed(2),e:+(t0+best[best.length-1]/100).toFixed(2),rate:+(100/(2*mh)).toFixed(1),depth:Math.round(depth*100)};
 }
 // sung notes run into each other: stretch each note over short gaps (consonants, breaths)
 function legato(notes){
@@ -200,29 +249,36 @@ function level(r){
 }
 
 // piano roll
-function draw(notes,trace,head){
+function draw(notes,trace,head,live){
   const cv=$("roll"),dpr=window.devicePixelRatio||1,W=cv.clientWidth,H=cv.clientHeight;
   cv.width=W*dpr;cv.height=H*dpr;const g=cv.getContext("2d");g.scale(dpr,dpr);g.clearRect(0,0,W,H);
-  const cs=getComputedStyle(document.documentElement),acc=cs.getPropertyValue("--accent"),mut=cs.getPropertyValue("--muted"),line=cs.getPropertyValue("--line");
+  const cs=getComputedStyle(document.documentElement),acc=cs.getPropertyValue("--accent"),mut=cs.getPropertyValue("--muted"),line=cs.getPropertyValue("--line"),fg=cs.getPropertyValue("--fg");
   const ms=[...(notes||[]).map(n=>n.m),...(trace||[]).filter(f=>f.m).map(f=>f.m)];
   if(!ms.length)return;
   let lo=Math.floor(Math.min(...ms))-2,hi=Math.ceil(Math.max(...ms))+2;if(hi-lo<12){const c=(hi+lo)/2;lo=Math.floor(c-6);hi=lo+12}
   const end=Math.max(1,...(notes||[]).map(n=>n.s+n.d),...(trace||[]).map(f=>f.t)),pad=6;
   const X=t=>pad+t/end*(W-pad*2),rowH=H/(hi-lo+1),Y=m=>H-(m-lo+1)*rowH;
   g.fillStyle=line;for(let m=lo;m<=hi;m++)if([1,3,6,8,10].includes((m%12+12)%12))g.fillRect(0,Y(m),W,rowH);
-  if(trace){g.fillStyle=mut;for(const f of trace)if(f.m)g.fillRect(X(f.t)-1,Y(f.m)+rowH/2-1,2,2)}
-  if(notes){g.fillStyle=acc;for(const n of notes){g.beginPath();g.roundRect?g.roundRect(X(n.s),Y(n.m)+1,Math.max(3,X(n.s+n.d)-X(n.s)-1),rowH-2,2):g.rect(X(n.s),Y(n.m)+1,Math.max(3,X(n.s+n.d)-X(n.s)-1),rowH-2);g.fill()}}
+  if(notes){g.fillStyle=acc;g.globalAlpha=trace&&trace.length?0.55:1;for(const n of notes){g.beginPath();g.roundRect?g.roundRect(X(n.s),Y(n.m)+1,Math.max(3,X(n.s+n.d)-X(n.s)-1),rowH-2,2):g.rect(X(n.s),Y(n.m)+1,Math.max(3,X(n.s+n.d)-X(n.s)-1),rowH-2);g.fill()}g.globalAlpha=1}
+  // the pitch actually sung, as a line that breaks over silences
+  if(trace){g.strokeStyle=live?mut:fg;g.lineWidth=1.5;g.lineJoin="round";g.beginPath();let prev=null;
+    for(const f of trace){if(!f.m){prev=null;continue}const x=X(f.t),y=Y(f.m)+rowH/2;if(prev&&f.t-prev.t<0.1)g.lineTo(x,y);else g.moveTo(x,y);prev=f}g.stroke()}
+  // vibrato: a wavy mark over the part of the note where it was sung
+  if(notes){g.strokeStyle=acc;g.lineWidth=1.5;for(const n of notes)if(n.vib){
+    const x0=X(n.vib.s),x1=Math.max(x0+8,X(n.vib.e)),y=Y(n.m)-5;g.beginPath();
+    for(let x=x0;x<=x1;x+=1)g[x===x0?"moveTo":"lineTo"](x,y+2*Math.sin((x-x0)/2.2));g.stroke()}}
   if(head!=null){g.fillStyle=mut;g.fillRect(X(head),0,1.5,H)}
 }
-function showMelody(notes,cur){
-  notes=legato(notes);
-  shown=notes;
+function showMelody(item,cur,head){
+  const notes=legato(item.notes);
+  shown=item;
   const seq=$("seq");seq.textContent="";
-  notes.forEach((n,i)=>{const b=document.createElement("b");b.textContent=nameOf(n.m);if(i===cur)b.className="now";seq.append(b," ")});
+  notes.forEach((n,i)=>{const b=document.createElement("b");b.textContent=nameOf(n.m)+(n.vib?"〜":"");if(n.vib)b.title="ビブラート "+n.vib.rate+"Hz・幅"+n.vib.depth+"セント";if(i===cur)b.className="now";seq.append(b," ")});
   $("note").textContent=cur!=null&&notes[cur]?nameOf(notes[cur].m):notes.length+"音";
   const dur=notes.length?notes[notes.length-1].s+notes[notes.length-1].d:0;
-  $("hz").textContent=dur.toFixed(1)+" 秒";
-  draw(notes);
+  const nv=notes.filter(n=>n.vib).length;
+  $("hz").textContent=dur.toFixed(1)+" 秒"+(nv?" · 〜 ビブラート":"");
+  draw(notes,curvePts(item.curve),head);
 }
 
 async function start(){
@@ -241,7 +297,7 @@ async function start(){
   const loop=()=>{
     const t=c.currentTime-t0;
     if(t!==last){last=t;analyser.getFloatTimeDomainData(buf);const hz=detect(buf,c.sampleRate),r=rmsOf(buf),m=hz?midiOf(hz):0;frames.push({t,m,r});level(r);
-      $("note").textContent=m?nameOf(m):"…";$("hz").textContent=t.toFixed(1)+" 秒";draw(null,frames)}
+      $("note").textContent=m?nameOf(m):"…";$("hz").textContent=t.toFixed(1)+" 秒";draw(null,frames,null,true)}
     raf=requestAnimationFrame(loop)};
   loop();timer=setTimeout(stop,MAX_SEC*1000);
 }
@@ -254,9 +310,9 @@ function stop(){
   finish(frames);
 }
 function finish(fr){
-  const notes=segment(fr);
-  if(!notes.length){$("status").textContent="メロディーを検出できませんでした。録音の音量を上げるか、もう少しはっきり歌ってみてください。";$("note").textContent="–";draw(null,fr);return}
-  add(notes);showMelody(notes);
+  const {notes,curve}=analyze(fr);
+  if(!notes.length){$("status").textContent="メロディーを検出できませんでした。録音の音量を上げるか、もう少しはっきり歌ってみてください。";$("note").textContent="–";draw(null,fr,null,true);return}
+  add(notes,curve);showMelody(saved[0]);
   $("status").textContent=notes.length+"音のメロディーを保存しました";
   playMelody(saved[0]);
 }
@@ -296,9 +352,9 @@ function playMelody(item){
   const end=notes[notes.length-1].s+notes[notes.length-1].d;
   const step=()=>{
     const t=c.currentTime-t0;
-    if(t>end+0.1){showMelody(notes);stopPlay();return}
+    if(t>end+0.1){showMelody(item);stopPlay();return}
     let cur=null;notes.forEach((n,i)=>{if(t>=n.s&&t<n.s+n.d)cur=i});
-    showMelody(notes,cur);draw(notes,null,Math.max(0,t));
+    showMelody(item,cur,Math.max(0,t));
     ticks=requestAnimationFrame(step)};
   step();
 }
@@ -309,7 +365,7 @@ try{saved=JSON.parse(localStorage.getItem("pitch-memo")||"[]")}catch(e){}
 saved=saved.map(s=>s.notes?s:{notes:[{m:Math.round(midiOf(s.hz)),s:0,d:1}],t:s.t});
 if(!saved.length)saved=[{t:"例",notes:[[60,0,.4],[62,.45,.4],[64,.9,.4],[65,1.35,.4],[67,1.8,.8]].map(([m,s,d])=>({m,s,d}))}];
 function persist(){try{localStorage.setItem("pitch-memo",JSON.stringify(saved.filter(s=>s.t!=="例")))}catch(e){}}
-function add(notes){const d=new Date();saved=saved.filter(s=>s.t!=="例");saved.unshift({notes,t:d.toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"})});persist();render()}
+function add(notes,curve){const d=new Date();saved=saved.filter(s=>s.t!=="例");saved.unshift({notes,curve,t:d.toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"})});persist();render()}
 function render(){
   const ul=$("list");ul.textContent="";
   if(!saved.length){const p=document.createElement("li");p.className="empty";p.textContent="まだありません。歌うとメロディーがここに残ります。";ul.appendChild(p);return}
@@ -319,7 +375,7 @@ function render(){
     const n=document.createElement("span");n.className="n";n.textContent=s.notes.map(x=>nameOf(x.m)).join(" ");
     const last=s.notes[s.notes.length-1];
     const m=document.createElement("span");m.className="meta";m.textContent=s.notes.length+"音 · "+(last.s+last.d).toFixed(1)+"秒 · "+s.t;
-    txt.append(n,m);txt.onclick=()=>{stopPlay();showMelody(s.notes)};
+    txt.append(n,m);txt.onclick=()=>{stopPlay();showMelody(s)};
     const p=document.createElement("button");p.className="play";p.type="button";
     p.textContent=playing===s?"■ 停止":"▶ 再生";p.onclick=()=>playing===s?stopPlay():playMelody(s);
     const x=document.createElement("button");x.className="del";x.type="button";x.setAttribute("aria-label","削除");x.textContent="×";
@@ -328,8 +384,8 @@ function render(){
   });
 }
 if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)$("fallback").hidden=false;
-render();showMelody(saved[0].notes);
-addEventListener("resize",()=>shown&&draw(shown));
+render();showMelody(saved[0]);
+addEventListener("resize",()=>shown&&showMelody(shown));
 </script>
 
 </body>
